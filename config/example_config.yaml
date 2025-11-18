@@ -1,0 +1,115 @@
+# config/example_config.yaml
+#
+# Strategy / portfolio configuration for the optimization GUI & engine.
+# This is loaded by RunConfig.py and provides all sensible defaults.
+# You can have one YAML per environment (dev, prod, etc.).
+
+global:
+  data_root: "data"            # base folder for input files
+  log_root: "logs"             # base folder for run logs
+  default_run_type: "main_rebalance"
+  default_risk_aversion: 1.0
+  default_cash_buffer_pct: 0.05   # 5% of NAV as default free cash band
+  default_asof_days_lag: 0        # 0 = today, 1 = yesterday, etc.
+
+run_types:
+  main_rebalance:
+    description: "Full portfolio rebalance against alpha, risk & costs."
+    apply_alpha: true
+    allow_etf_create_redeem: false
+    allow_efp: false
+    allow_new_shorts: true
+    risk_aversion_multiplier: 1.0
+    turnover_cap_pct_gross: 0.25       # max turnover as % of gross
+    enforce_factor_neutrality: false
+    soft_factor_neutrality_penalty: 0.5
+
+  cash_injection:
+    description: "Deploy incremental cash with minimal reshuffle."
+    apply_alpha: true
+    allow_etf_create_redeem: false
+    allow_efp: false
+    allow_new_shorts: true
+    risk_aversion_multiplier: 0.9
+    turnover_cap_pct_gross: 0.15
+    enforce_factor_neutrality: true
+    soft_factor_neutrality_penalty: 0.8
+
+  true_up:
+    description: "Reduce gross / basis and clean residuals."
+    apply_alpha: false
+    allow_etf_create_redeem: true
+    allow_efp: true
+    allow_new_shorts: false
+    risk_aversion_multiplier: 0.7
+    turnover_cap_pct_gross: 0.4
+    enforce_factor_neutrality: true
+    soft_factor_neutrality_penalty: 1.0
+
+  hedge_finder:
+    description: "Find best hedges for a given risk / exposure profile."
+    apply_alpha: false
+    allow_etf_create_redeem: false
+    allow_efp: true
+    allow_new_shorts: true
+    risk_aversion_multiplier: 1.2
+    turnover_cap_pct_gross: 0.10
+    enforce_factor_neutrality: false
+    soft_factor_neutrality_penalty: 0.0
+
+  efp_arb:
+    description: "Focus on EFP / synthetic ETF/Futures arbitrage trades."
+    apply_alpha: false
+    allow_etf_create_redeem: true
+    allow_efp: true
+    allow_new_shorts: true
+    risk_aversion_multiplier: 0.5
+    turnover_cap_pct_gross: 0.3
+    enforce_factor_neutrality: true
+    soft_factor_neutrality_penalty: 0.5
+
+portfolios:
+  EQ_CORE:
+    name: "Equity Core"
+    base_universe_flags: ["core_equity"]
+    hedge_universe_flags: ["index_future", "broad_etf"]
+    benchmark_id: "SPX"
+    leverage_max: 2.0
+    gross_exposure_max_pct_nav: 200.0
+    net_exposure_target_pct_nav: 100.0
+    net_exposure_band_pct_nav: 5.0   # +/- around target
+    turnover_cap_pct_gross: 0.25
+    allow_new_shorts: true
+    risk_aversion: 1.2
+    cash_buffer_pct: 0.05
+    default_run_type: "main_rebalance"
+
+  EQ_MARKET_NEUTRAL:
+    name: "Equity Market Neutral"
+    base_universe_flags: ["core_equity"]
+    hedge_universe_flags: ["index_future", "sector_etf"]
+    benchmark_id: "NONE"
+    leverage_max: 4.0
+    gross_exposure_max_pct_nav: 400.0
+    net_exposure_target_pct_nav: 0.0
+    net_exposure_band_pct_nav: 2.0
+    turnover_cap_pct_gross: 0.40
+    allow_new_shorts: true
+    risk_aversion: 1.5
+    cash_buffer_pct: 0.02
+    default_run_type: "main_rebalance"
+
+  ETF_ARBITRAGE:
+    name: "ETF Arb Book"
+    base_universe_flags: ["etf", "single_stock"]
+    hedge_universe_flags: ["index_future"]
+    benchmark_id: "NONE"
+    leverage_max: 3.0
+    gross_exposure_max_pct_nav: 300.0
+    net_exposure_target_pct_nav: 0.0
+    net_exposure_band_pct_nav: 5.0
+    turnover_cap_pct_gross: 0.50
+    allow_new_shorts: true
+    risk_aversion: 0.8
+    cash_buffer_pct: 0.03
+    default_run_type: "efp_arb"

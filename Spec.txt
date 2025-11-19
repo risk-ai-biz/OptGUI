@@ -1,0 +1,755 @@
+
+---
+
+📘 SPECIFICATION DOCUMENT — Single-Period Optimization Platform
+
+Version 0.2 — Finalized Architecture (based on Q1–Q7 answers)
+Technologies: Python, Polars, Numpy, Mosek Fusion (initial solver), iPyWidgets, ipydatagrid
+Objectives: Multi-asset optimization, synthetic arbitrage, risk-cost tradeoff, intraday usability, AI-assisted diagnostics
+
+
+---
+
+1. SYSTEM OVERVIEW
+
+This system performs single-period portfolio optimization across:
+
+Equities
+
+ETFs
+
+Listed Futures
+
+Synthetic instruments (ETF baskets, future baskets, EFP constructs)
+
+
+Supporting:
+
+Rebalances
+
+Hedging
+
+EFP and create/redeem workflows
+
+Index arbitrage (margin modeling required)
+
+Cross-currency portfolios
+
+Intraday updates
+
+AI-assisted diagnostics (MCP)
+
+
+By design:
+
+Universe size: ~2,000 baseline → ~15,000 including synthetics
+
+Parquet inputs for efficient Polars loads
+
+Risk models from multiple sources (in-house, Axioma)
+
+Cash is a first-class instrument
+
+Margin & Haircut modeling is included
+
+Multi-currency portfolios via a numeraire abstraction
+
+OMS output: (symbol, buy|sell, shares)
+
+
+This system is intended to become the central trading/decision engine.
+
+
+---
+
+2. HIGH-LEVEL ARCHITECTURE (UPDATED)
+
++------------------------------------------------------------------+
+|                            GUI Layer                             |
+|         iPyWidgets + ipydatagrid; replaceable front-end          |
++----------------------------+--------------------------------------+
+                             |
+                             v
++------------------------------------------------------------------+
+|                            App State                             |
+| Holds all dynamic state for a run:                               |
+| config, run_context, data snapshots, constraints, settings,      |
+| results, logging, numeraire, currency mappings                   |
++----------------------------+--------------------------------------+
+                             |
+                             v
++------------------------------------------------------------------+
+|                        Data Management Layer                     |
+|  - Parquet readers (Polars)                                      |
+|  - Static SoD loader (risk, cost, liquidity, restrictions)        |
+|  - Intraday loader (positions & cash)                             |
+|  - Symbology validation                                           |
+|  - Universe Builder (joins & validations)                         |
++----------------------------+--------------------------------------+
+                             |
+                             v
++------------------------------------------------------------------+
+|                         Constraint Engine                        |
+| Instrument-level, group-level, portfolio-level constraints       |
+| Derived metrics (%ADV, %NAV, %gross, haircut-adjusted exposure)  |
++----------------------------+--------------------------------------+
+                             |
+                             v
++------------------------------------------------------------------+
+|                     Optimization Settings Layer                  |
+| Alpha, risk, costs, synthetics, representation (weights),        |
+| margin/haircut rules, multi-currency numeraire handling          |
++----------------------------+--------------------------------------+
+                             |
+                             v
++------------------------------------------------------------------+
+|                     Optimization Engine (Mosek)                  |
+| QP/SOCP model builder                                            |
+| Includes:                                                        |
+| - Factor risk (Axioma / in-house)                                |
+| - Impact models                                                  |
+| - Cross-currency conversion via numeraire                        |
+| - Synthetic baskets (ETF, future)                                |
+| - Margin requirements (per instrument)                           |
+| Outputs:                                                         |
+| - optimal, trades, diagnostics                                   |
++----------------------------+--------------------------------------+
+                             |
+                             v
++------------------------------------------------------------------+
+|                       AI-Assisted Logging (MCP)                  |
+| Structured run logs → AI suggestions on constraints, data,       |
+| settings, risk exposures, synthetics usage                       |
++------------------------------------------------------------------+
+
+
+---
+
+3. APPLICATION STATE (EXPANDED)
+
+class AppState:
+    config: RunConfig
+    run_context: RunContext | None
+
+    static_snapshot: dict[str, pl.DataFrame] | None     # SoD data
+    intraday_state: dict[str, pl.DataFrame] | None      # positions + cash
+
+    universe: pl.DataFrame | None                       # merged dataset
+
+    constraints: dict[str, pl.DataFrame]                # inst/group/portfolio
+    optimization_settings: dict[str, Any]               # run-level overrides
+
+    optimization_result: dict[str, pl.DataFrame] | None # current, optimal, trades
+    constraint_diagnostics: pl.DataFrame | None
+
+    # Multi-currency
+    numeraire: str                                      # "USD", default
+    fx_rates: dict[str, float]                          # currency → USD conversion
+
+    # Logging
+    run_id: str
+    logger: RunLogger
+
+
+---
+
+4. DATA LAYER (FINALIZED)
+
+4.1 Parquet-Based SoD Data (Global Universe ≈ 10,000 instruments)
+
+Standard tables:
+
+instruments.parquet
+
+instrument_id
+
+ticker
+
+type (Equity, ETF, Future, Synthetic_XXX)
+
+primary_listing
+
+currency
+
+sector / industry
+
+universe_flags
+
+expiry (futures)
+
+contract_multiplier
+
+ETF basket composition (optional or separate file)
+
+
+risk_model.parquet
+
+instrument_id
+
+factor_loadings (vector)
+
+factor_exposures
+
+idio_variance
+
+model_type (“axioma”, “in_house”)
+
+factor_set_name
+
+
+liquidity.parquet
+
+ADV (value)
+
+ADV_shares
+
+spread
+
+volatility metrics
+
+
+cost_model.parquet
+
+execution linear cost
+
+execution quadratic cost
+
+short borrow rate
+
+financing rate
+
+dividend yield
+
+
+restrictions.parquet
+
+restricted
+
+no_new_shorts
+
+no_new_longs
+
+
+margin_model.parquet
+
+initial_margin_requirement
+
+maintenance_margin_requirement
+
+haircut
+
+synthetic_margin_override (optional)
+
+
+
+---
+
+4.2 Intraday Data (Parquet)
+
+positions.parquet
+
+instrument_id
+
+position_shares
+
+price
+
+currency
+
+
+cash.parquet
+
+currency
+
+cash_amount
+
+
+All loaded using Polars.
+
+
+---
+
+5. MULTI-CURRENCY HANDLING (NUMERAIRE)
+
+5.1 Definition
+
+User selects numeraire (default "USD").
+
+All positions, costs, and risk are expressed in numeraire units.
+
+FX table maps instrument currency → numeraire.
+
+
+5.2 Conversions
+
+notional_numeraire = notional_local * fx_rate[currency]
+
+Risk is converted using:
+
+Factor returns in numeraire
+
+FX exposures as synthetic risk factors (optional)
+
+
+5.3 Cash per currency
+
+Cash table must include:
+
+cash_amount
+
+currency
+
+
+Cash converted to numeraire internally.
+
+
+---
+
+6. SYNTHETICS MODELING (ETF, FUT, EFP)
+
+6.1 ETF Baskets (Create/Redeem)
+
+For ETF E:
+
+x_E + Σ w_j * x_j = 0   (synthetic equivalence)
+
+Controls:
+
+allow_create_redeem: bool
+
+max_redeem_notional
+
+synthetic slippage cost
+
+min_block_size
+
+
+6.2 Futures
+
+Futures handled with:
+
+notional = price * contract_multiplier * position
+
+Cleaner margin modeling:
+
+initial & maintenance margin
+
+futures-only haircut rules
+
+EFP structure can be modeled as:
+
+
+long future + short basket  ==  basis exposure
+
+6.3 EFP
+
+EFP modeling includes:
+
+execution cost of cash leg
+
+exchange fees
+
+basis spread
+
+margin benefit (lower balance sheet usage when perfectly hedged)
+
+
+Example:
+
+EFP_trade = (future_position_change, basket_trade_weights)
+
+Margin contribution becomes:
+
+margin(EFP) < margin(future) + margin(basket)
+
+We support explicit margin credit for hedged legs.
+
+
+---
+
+7. MARGIN / HAIRCUT MODELING
+
+Each instrument has:
+
+initial_margin
+
+maintenance_margin
+
+haircut_factor
+
+
+Portfolio margin constraint:
+
+sum( |x_i| * haircut_i )  ≤  margin_budget
+
+For futures:
+
+margin_future = |x_future| * initial_margin_future
+
+For synthetic hedges (ETF basket or index basket):
+
+effective_margin = margin(long) + margin(short) - hedge_credit
+
+Index arb use-case:
+Large notional, low net margin due to tight hedge → must be supported.
+
+
+---
+
+8. UNIVERSE BUILDER (EXPANDED)
+
+Universe Builder merges:
+
+instrument
+
+risk model
+
+liquidity
+
+costs
+
+restrictions
+
+margin data
+
+positions
+
+cash
+
+FX rates
+
+synthetic definitions
+
+
+Adds derived fields:
+
+position_notional (numeraire)
+
+current_weight_net, weight_gross, weight_long_leg, weight_short_leg, max-leg weight
+
+liquidity metrics: position/ADV, potential trade/ADV
+
+restricted flags
+
+margin & haircut exposure
+
+synthetic decomposition validity flags
+
+
+Validation diagnostics:
+
+missing risk
+
+missing cost
+
+invalid symbol
+
+unhedgeable synthetic
+
+mismatched basket weights
+
+
+
+---
+
+9. CONSTRAINT ENGINE (FINALIZED)
+
+9.1 Instrument Constraints (per instrument)
+
+max_position_notional
+
+max_trade_notional
+
+max_%ADV_position
+
+max_%ADV_trade
+
+no_new_shorts
+
+no_new_longs
+
+max_margin_contribution
+
+
+9.2 Group Constraints
+
+exposure_by_sector
+
+exposure_by_country
+
+exposure_by_custom_bucket
+
+exposure_by_factor (optional)
+
+turnover_by_group
+
+margin_by_group
+
+
+9.3 Portfolio Constraints
+
+net_exposure_target ± band
+
+gross_exposure_max
+
+leverage_max
+
+cash band
+
+turnover_limit
+
+must_be_market_neutral
+
+must_be_factor_neutral
+
+margin_budget
+
+
+All constraints passed to solver via normalized representation (lower, upper, soft, penalty).
+
+
+---
+
+10. OPTIMIZATION SETTINGS (UPDATED)
+
+10.1 Alpha
+
+apply/not apply
+
+scaling
+
+normalization toggles
+
+
+10.2 Risk
+
+risk_aversion
+
+factor neutrality
+
+idio vs full model
+
+additional FX factor risk
+
+
+10.3 Costs
+
+execution
+
+borrow
+
+financing
+
+dividends
+
+slippage
+
+synthetic ARB costs
+
+
+10.4 Synthetics
+
+allow ETF create/redeem
+
+allow EFP
+
+min/max block sizes
+
+synthetic margin credit
+
+
+10.5 Position representation
+
+shares
+
+notional
+
+net/gross/leg weights
+
+
+10.6 Multi-currency
+
+numeraire selector
+
+FX factors on/off
+
+
+
+---
+
+11. OPTIMIZATION ENGINE (Mosek Fusion)
+
+All logic built in notionals in numeraire, then converted to shares for output.
+
+Outputs:
+
+df_optimal (positions)
+
+df_trades (optimal – current)
+
+df_current (validation)
+
+constraint diagnostics (slack, dual, binding)
+
+problem summary
+
+
+
+---
+
+12. GUI LAYER (WITH TABS & ACCORDIONS)
+
+Tab 1 – Config
+
+Load/save config, run context builder
+
+Tab 2 – Data & Universe
+
+Risk, positions, merged universe, validation
+
+Tab 3 – Constraints
+
+Instrument, group, portfolio, pre-solve diagnostics
+
+Tab 4 – Optimization Settings
+
+Risk/cost/synthetics/representation/margin
+
+Tab 5 – Run & Results
+
+Validation → Solve → Trades → Post-trade → Constraint diagnostics
+
+
+---
+
+13. AI-ASSISTED LOGGING (MCP)
+
+Structured JSON log includes:
+
+run metadata
+
+config snapshot
+
+data QC
+
+constraint sets (before)
+
+settings
+
+solver diagnostics (slack, dual, status)
+
+results summary
+
+
+AI use cases:
+
+1. Suggest constraint relaxations
+
+
+2. Spot overly tight/loose exposures
+
+
+3. Detect data issues (missing risk, etc.)
+
+
+4. Identify synthetic inefficiencies
+
+
+5. Suggest better parameter settings
+
+
+
+
+---
+
+14. OMS OUTPUT FORMAT
+
+Precisely as requested:
+
+symbol, buy|sell, shares
+
+Shares rounded to nearest integer
+
+Futures: use contract units
+
+ETFs: whole shares
+
+FX trades (if needed) follow same format: “currency_pair, buy|sell, notional” (optional)
+
+
+
+---
+
+15. REMAINING PLACEHOLDERS FOR FUTURE EXPANSION
+
+High-frequency / streaming updates
+
+Infrastructure for model versioning
+
+Execution simulator / TCA feedback
+
+Advanced futures curve modeling
+
+Repo market modeling for financing spreads
+
+Sector/industry mapping overrides
+
+Instrument decay logic (expired contracts, delistings)
+
+
+
+---
+
+16. CONFIRMATION / NEXT STEPS
+
+We now have a complete engineering-grade specification that:
+
+incorporates your Q1–Q7 requirements
+
+supports universal universe sizes (~15k instruments)
+
+is compatible with Parquet and Polars
+
+handles multi-currency portfolios via numeraire
+
+handles ETF create/redeem and EFP
+
+includes margin/haircut modeling suitable for index arbitrage
+
+defines a clear GUI workflow
+
+integrates AI-assisted logging
+
+
+
+---
+
+✔ Before I generate the code skeleton and GUI notebook, please confirm:
+
+A. Should I automatically generate full project scaffolding now?
+
+/config
+
+/src/data
+
+/src/constraints
+
+/src/optimizer
+
+/src/gui
+
+/tests
+
+OptGUI.ipynb with full tabs & callbacks
+
+RunConfig.py (final version)
+
+logging & AI hooks
+
+
+B. Do you want the ETF basket + futures contract metadata included in this first build?
+
+C. Should we integrate Axioma-style risk model loaders now, or leave them as placeholders?
+
+Once I have your answers, I will generate the entire initial codebase — clean, modular, documented — ready to run.
+

@@ -1,72 +1,144 @@
 # config/example_config.yaml
 #
-# Strategy / portfolio configuration for the optimization GUI & engine.
-# This is loaded by RunConfig.py and provides all sensible defaults.
-# You can have one YAML per environment (dev, prod, etc.).
+# Example configuration aligned to the finalized single-period optimization
+# specification (Spec.txt). Use this as a touch point when adding new
+# functionality—every major subsystem has a placeholder here. Values are
+# intentionally opinionated but safe for local experimentation.
 
 global:
-  data_root: "data"            # base folder for input files
-  log_root: "logs"             # base folder for run logs
+  data_root: "data"                      # Base folder for static + intraday parquet inputs
+  log_root: "logs"                      # Run logs, solver diagnostics, MCP summaries
+  asof_days_lag: 0                       # 0=today, 1=yesterday; used for rolling loads
+  numeraire: "USD"                       # Portfolio reporting currency (multi-currency ready)
   default_run_type: "main_rebalance"
-  default_risk_aversion: 1.0
-  default_cash_buffer_pct: 0.05   # 5% of NAV as default free cash band
-  default_asof_days_lag: 0        # 0 = today, 1 = yesterday, etc.
+  default_portfolio: "EQ_CORE"
+  default_risk_model: "axioma_demo"      # Swap to in_house for custom factor sets
+  default_cash_buffer_pct: 0.05           # NAV held as free cash unless overridden
+  default_haircut_pct: 0.02               # Fallback haircut when instrument rules are absent
+  allow_margin: true                      # Enables margin-aware exposure limits
+  enable_ai_logging: true                 # Emit structured MCP payloads for AI diagnostics
+
+data_sources:
+  static_parquet:
+    instruments: "${data_root}/sod/instruments.parquet"      # Symbology, sector/industry, multipliers
+    risk_factors: "${data_root}/sod/risk_factors.parquet"    # Factor exposures per instrument
+    risk_cov: "${data_root}/sod/risk_covariance.parquet"     # Factor covariance matrix
+    costs: "${data_root}/sod/costs.parquet"                  # Spread/impact curves (%ADV), borrow rates
+    restrictions: "${data_root}/sod/restrictions.parquet"    # Hard blocks, soft flags, locates
+    haircuts: "${data_root}/sod/haircuts.parquet"            # Margin & financing haircuts
+    baskets: "${data_root}/sod/baskets.parquet"              # ETF/future basket compositions
+    fx_rates: "${data_root}/sod/fx_rates.parquet"            # Spot FX + cross rates
+  intraday_parquet:
+    positions: "${data_root}/intraday/positions.parquet"     # Holdings, tax lots (if available)
+    cash: "${data_root}/intraday/cash.parquet"               # Cash by currency
+    borrow: "${data_root}/intraday/borrow.parquet"           # Intraday locate changes
+
+risk_models:
+  axioma_demo:
+    type: "axioma"
+    use_factor_risk: true
+    use_specific_risk: true
+    fallback_sigma: 0.25            # Used if exposures missing
+  in_house:
+    type: "custom"
+    use_factor_risk: true
+    use_specific_risk: true
+    factor_schema: "custom_v1"      # Hook for future schema evolution
+
+cost_models:
+  default:
+    adv_lookback_days: 20
+    adv_cap_pct: 10.0                # Cap volumes to this %ADV per name
+    impact_coefficient: 1.0          # Multiplier applied to curve-based impact
+    borrow_fee_bps_override: null    # Optional global override
+    enforce_round_lots: true
+
+margin_rules:
+  haircut_priority: ["instrument", "sector", "fallback"]
+  fx_margin_buffer_bps: 25
+  default_instrument_haircut_pct: 2.0
+  allow_cross_margin: true           # Enables offsets for index arb / hedged pairs
+
+synthetics:
+  allow_etf_create_redeem: true
+  allow_efp: true
+  basket_tolerance_bps: 5            # Max weight drift before recomputing basket trades
+  pricing_method: "mid"              # mid | bid | ask; affects synthetic legs
+
+solver:
+  backend: "mosek"
+  objective_scaling: 1.0
+  max_runtime_seconds: 60
+  feasibility_tolerance: 1e-6
+  enable_socp: true                  # Allow SOCP for margin/impact cones
+  diagnostics:
+    export_lp: false
+    store_duals: true
+
+ai_logging:
+  enable: true
+  capture:
+    - "data_qc"                      # Missing exposures, stale prices, absent haircuts
+    - "constraint_status"            # Slack/tightness
+    - "synthetic_efficiency"         # ETF vs future vs basket efficiency
+    - "risk_hotspots"                # Factor/sector concentration
+    - "parameter_suggestions"        # Suggested penalty tweaks
 
 run_types:
   main_rebalance:
-    description: "Full portfolio rebalance against alpha, risk & costs."
+    description: "Full portfolio rebalance against alpha, risk, costs."
     apply_alpha: true
-    allow_etf_create_redeem: false
-    allow_efp: false
     allow_new_shorts: true
-    risk_aversion_multiplier: 1.0
-    turnover_cap_pct_gross: 0.25       # max turnover as % of gross
     enforce_factor_neutrality: false
     soft_factor_neutrality_penalty: 0.5
+    turnover_cap_pct_gross: 25.0
+    risk_aversion_multiplier: 1.0
+    use_intraday_positions: true
+    allow_margin: true
 
   cash_injection:
-    description: "Deploy incremental cash with minimal reshuffle."
+    description: "Deploy incremental cash while minimizing reshuffle."
     apply_alpha: true
-    allow_etf_create_redeem: false
-    allow_efp: false
     allow_new_shorts: true
-    risk_aversion_multiplier: 0.9
-    turnover_cap_pct_gross: 0.15
     enforce_factor_neutrality: true
     soft_factor_neutrality_penalty: 0.8
+    turnover_cap_pct_gross: 15.0
+    risk_aversion_multiplier: 0.9
+    use_intraday_positions: true
+    allow_margin: false
 
   true_up:
-    description: "Reduce gross / basis and clean residuals."
+    description: "Reduce gross/basis, clean residuals, tighten hedges."
     apply_alpha: false
-    allow_etf_create_redeem: true
-    allow_efp: true
     allow_new_shorts: false
-    risk_aversion_multiplier: 0.7
-    turnover_cap_pct_gross: 0.4
     enforce_factor_neutrality: true
     soft_factor_neutrality_penalty: 1.0
+    turnover_cap_pct_gross: 40.0
+    risk_aversion_multiplier: 0.7
+    use_intraday_positions: true
+    allow_margin: true
 
   hedge_finder:
-    description: "Find best hedges for a given risk / exposure profile."
+    description: "Best hedges for a target risk or exposure profile."
     apply_alpha: false
-    allow_etf_create_redeem: false
-    allow_efp: true
     allow_new_shorts: true
-    risk_aversion_multiplier: 1.2
-    turnover_cap_pct_gross: 0.10
     enforce_factor_neutrality: false
     soft_factor_neutrality_penalty: 0.0
+    turnover_cap_pct_gross: 10.0
+    risk_aversion_multiplier: 1.2
+    use_intraday_positions: true
+    allow_margin: true
 
   efp_arb:
-    description: "Focus on EFP / synthetic ETF/Futures arbitrage trades."
+    description: "EFP / synthetic ETF-future arbitrage focus."
     apply_alpha: false
-    allow_etf_create_redeem: true
-    allow_efp: true
     allow_new_shorts: true
-    risk_aversion_multiplier: 0.5
-    turnover_cap_pct_gross: 0.3
     enforce_factor_neutrality: true
     soft_factor_neutrality_penalty: 0.5
+    turnover_cap_pct_gross: 30.0
+    risk_aversion_multiplier: 0.5
+    use_intraday_positions: true
+    allow_margin: true
 
 portfolios:
   EQ_CORE:
@@ -77,12 +149,13 @@ portfolios:
     leverage_max: 2.0
     gross_exposure_max_pct_nav: 200.0
     net_exposure_target_pct_nav: 100.0
-    net_exposure_band_pct_nav: 5.0   # +/- around target
-    turnover_cap_pct_gross: 0.25
+    net_exposure_band_pct_nav: 5.0
+    turnover_cap_pct_gross: 25.0
     allow_new_shorts: true
     risk_aversion: 1.2
     cash_buffer_pct: 0.05
     default_run_type: "main_rebalance"
+    currency_overrides: {}           # e.g., {"JPY": 0.2} to cap FX concentrations
 
   EQ_MARKET_NEUTRAL:
     name: "Equity Market Neutral"
@@ -93,11 +166,14 @@ portfolios:
     gross_exposure_max_pct_nav: 400.0
     net_exposure_target_pct_nav: 0.0
     net_exposure_band_pct_nav: 2.0
-    turnover_cap_pct_gross: 0.40
+    turnover_cap_pct_gross: 40.0
     allow_new_shorts: true
     risk_aversion: 1.5
     cash_buffer_pct: 0.02
     default_run_type: "main_rebalance"
+    factor_neutrality_targets:
+      style: 0.0
+      industry: 0.0
 
   ETF_ARBITRAGE:
     name: "ETF Arb Book"
@@ -108,8 +184,18 @@ portfolios:
     gross_exposure_max_pct_nav: 300.0
     net_exposure_target_pct_nav: 0.0
     net_exposure_band_pct_nav: 5.0
-    turnover_cap_pct_gross: 0.50
+    turnover_cap_pct_gross: 50.0
     allow_new_shorts: true
     risk_aversion: 0.8
     cash_buffer_pct: 0.03
     default_run_type: "efp_arb"
+    synthetic_preferences:
+      prefer_create_redeem: true
+      prefer_futures_over_borrow: true
+
+oms_output:
+  format: "symbol, side, shares"        # Matches Spec.txt guidance
+  round_shares: true
+  futures_use_contract_units: true
+  fx_output_enabled: true
+

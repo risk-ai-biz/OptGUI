@@ -22,10 +22,67 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 from pathlib import Path
+import ast
 import datetime as dt
 
-import yaml
 import polars as pl
+
+try:
+    import yaml  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback logic below
+    yaml = None
+
+
+def _load_yaml_or_fallback(path: Path) -> Dict[str, Any]:
+    """Load YAML with a tiny fallback parser if PyYAML is unavailable.
+
+    The fallback understands the subset used in ``config/example_config.yaml``:
+    nested mappings with scalar values or inline lists. Comments and blank
+    lines are ignored. It is not a general-purpose YAML parser, but it keeps
+    the demo runnable in restricted environments.
+    """
+
+    text = path.read_text()
+
+    if yaml is not None:
+        return yaml.safe_load(text)
+
+    cleaned_lines = []
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].rstrip()
+        if stripped:
+            cleaned_lines.append(stripped)
+
+    root: Dict[str, Any] = {}
+    stack: list[tuple[int, Dict[str, Any]]] = [(0, root)]
+
+    for line in cleaned_lines:
+        indent = len(line) - len(line.lstrip(" "))
+        key, _, value_str = line.strip().partition(":")
+        value_str = value_str.strip()
+
+        while stack and indent < stack[-1][0]:
+            stack.pop()
+
+        current = stack[-1][1]
+
+        if not value_str:
+            new_dict: Dict[str, Any] = {}
+            current[key] = new_dict
+            stack.append((indent + 2, new_dict))
+            continue
+
+        if value_str.lower() in {"true", "false"}:
+            value: Any = value_str.lower() == "true"
+        else:
+            try:
+                value = ast.literal_eval(value_str)
+            except Exception:
+                value = value_str
+
+        current[key] = value
+
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +216,7 @@ class RunConfig:
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
 
-        with path.open("r") as f:
-            raw = yaml.safe_load(f)
+        raw = _load_yaml_or_fallback(path)
 
         # --- Global settings ---
         g = raw.get("global", {})

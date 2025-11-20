@@ -1,5 +1,6 @@
 # Cell 1: imports & configuration load
 
+from dataclasses import dataclass, field
 from pathlib import Path
 import datetime as dt
 
@@ -9,7 +10,8 @@ from IPython.display import display
 import ipywidgets as widgets
 from ipydatagrid import DataGrid
 
-from RunConfig import RunConfig
+from RunConfig import RunConfig, RunContext
+from example_data import compute_stub_trades, load_intraday_state, load_static_snapshot
 
 # Load configuration
 CONFIG_PATH = Path("config/example_config.yaml")
@@ -17,107 +19,32 @@ run_config = RunConfig.from_yaml(CONFIG_PATH)
 
 print(f"Loaded config: {len(run_config.portfolios)} portfolios, {len(run_config.run_types)} run types.")
 
-# Cell 2: data loading helpers
-#
-# These functions should be wired to your actual SoD / intraday data.
-# For now, they are simple placeholders showing expected interfaces.
-
 DATA_ROOT = run_config.global_settings.data_root
 
-def load_static_snapshot(as_of: dt.date) -> dict[str, pl.DataFrame]:
-    """
-    Load static 'start of day' data for the given date.
 
-    Returns a dictionary of Polars DataFrames, e.g.:
-        {
-            "instruments": df_instr,
-            "risk_model_summary": df_risk,
-            "cost_params": df_costs,
-            "restrictions": df_restr,
-            ...
-        }
+@dataclass
+class AppState:
+    """Hold the GUI's dynamic state for a run."""
 
-    In production, you might read from Parquet/CSV/DB using Polars.
-    """
-    # Placeholder example: you can swap this for real file loads.
-    # For now, create a tiny dummy instruments universe.
+    config: RunConfig
+    run_context: RunContext | None = None
+    snapshot: dict[str, pl.DataFrame] | None = None
+    intraday: dict[str, pl.DataFrame] | None = None
+    trades: pl.DataFrame | None = None
+    messages: list[str] = field(default_factory=list)
 
-    df_instr = pl.DataFrame(
-        {
-            "instrument_id": ["AAPL", "SPY", "ESZ5"],
-            "ticker": ["AAPL", "SPY", "ESZ5"],
-            "type": ["Equity", "ETF", "Future"],
-            "universe_flags": [["core_equity"], ["broad_etf"], ["index_future"]],
-            "currency": ["USD", "USD", "USD"],
-            "sector": ["Technology", "Multi", "Index Future"],
-        }
-    )
+    def log(self, msg: str) -> None:
+        self.messages.append(msg)
 
-    df_risk = pl.DataFrame(
-        {
-            "instrument_id": ["AAPL", "SPY", "ESZ5"],
-            "has_factor_loadings": [True, True, True],
-            "idio_var": [0.15, 0.08, 0.05],
-        }
-    )
-
-    df_costs = pl.DataFrame(
-        {
-            "instrument_id": ["AAPL", "SPY", "ESZ5"],
-            "spread_bps": [5.0, 1.0, 0.5],
-            "borrow_rate": [0.02, 0.0, 0.0],
-        }
-    )
-
-    df_restr = pl.DataFrame(
-        {
-            "instrument_id": ["AAPL"],
-            "restricted": [False],
-            "no_new_shorts": [False],
-        }
-    )
-
-    return {
-        "instruments": df_instr,
-        "risk_model_summary": df_risk,
-        "cost_params": df_costs,
-        "restrictions": df_restr,
-    }
+    def clear(self) -> None:
+        self.run_context = None
+        self.snapshot = None
+        self.intraday = None
+        self.trades = None
+        self.messages.clear()
 
 
-def load_intraday_state(portfolio_id: str, as_of: dt.date) -> dict[str, pl.DataFrame]:
-    """
-    Load current positions, cash, PnL, etc. for a given portfolio and date.
-
-    Returns:
-        {
-            "positions": df_pos,
-            "cash": df_cash (single-row),
-            ...
-        }
-
-    Again, this is a stub — wire it to your real source.
-    """
-    df_pos = pl.DataFrame(
-        {
-            "instrument_id": ["AAPL", "SPY", "ESZ5"],
-            "position": [1_000_000.0, 2_000_000.0, -10_000_000.0],  # notional example
-            "price": [190.0, 500.0, 5200.0],
-        }
-    )
-
-    df_cash = pl.DataFrame(
-        {
-            "portfolio_id": [portfolio_id],
-            "cash": [5_000_000.0],
-            "currency": ["USD"],
-        }
-    )
-
-    return {
-        "positions": df_pos,
-        "cash": df_cash,
-    }
+app_state = AppState(config=run_config)
 
 # Cell 3: core widgets for run configuration
 
@@ -225,7 +152,10 @@ def on_load_snapshot_clicked(btn):
     ra_override = float(ra_override_val) if ra_override_val not in (None, "") else None
 
     with log_output:
-        print(f"Loading snapshot for portfolio={portfolio_id}, run_type={run_type_name}, as_of={as_of}...")
+        app_state.clear()
+        print(
+            f"Loading snapshot for portfolio={portfolio_id}, run_type={run_type_name}, as_of={as_of}..."
+        )
         current_run_context = run_config.make_run_context(
             portfolio_id=portfolio_id,
             run_type_name=run_type_name,
@@ -233,13 +163,19 @@ def on_load_snapshot_clicked(btn):
             cash_injection=cash_injection,
             custom_risk_aversion=ra_override,
         )
+        app_state.run_context = current_run_context
+
         print("Resolved RunContext:")
         print(f"  effective risk aversion: {current_run_context.effective_risk_aversion:.3f}")
-        print(f"  effective turnover cap:  {current_run_context.effective_turnover_cap_pct_gross:.1f}% of gross")
+        print(
+            f"  effective turnover cap:  {current_run_context.effective_turnover_cap_pct_gross:.1f}% of gross"
+        )
 
         # Load SoD + intraday data
         current_snapshot = load_static_snapshot(as_of)
         current_intraday = load_intraday_state(portfolio_id, as_of)
+        app_state.snapshot = current_snapshot
+        app_state.intraday = current_intraday
 
         # Basic validation examples
         df_instr = current_snapshot["instruments"]
@@ -251,7 +187,9 @@ def on_load_snapshot_clicked(btn):
 
         print(f"Universe size: {df_instr.height} instruments.")
         if missing_risk.height > 0:
-            print(f"WARNING: {missing_risk.height} instruments missing risk model; they may be dropped or treated conservatively.")
+            print(
+                f"WARNING: {missing_risk.height} instruments missing risk model; they may be dropped or treated conservatively."
+            )
 
     # Show instruments in grid
     with instr_output:
@@ -261,6 +199,14 @@ def on_load_snapshot_clicked(btn):
             .join(current_snapshot["cost_params"], on="instrument_id", how="left")
         )
         display(DataGrid(df_view.to_pandas(), layout={"height": "300px"}))
+        display(widgets.Label("Constraints (illustrative):"))
+        display(
+            DataGrid(
+                current_snapshot["constraints"].to_pandas(),
+                layout={"height": "140px"},
+                base_row_size=24,
+            )
+        )
 
 
 # Cell 5: 'Run optimizer' stub – inspect run context & data
@@ -283,6 +229,9 @@ def on_run_optimizer_clicked(btn):
     df_pos = intraday["positions"]
     df_cash = intraday["cash"]
 
+    trades = compute_stub_trades(snapshot, intraday)
+    app_state.trades = trades
+
     with results_output:
         print("=== Optimization Run (Stub) ===")
         print(f"Portfolio: {ctx.portfolio.portfolio_id} ({ctx.portfolio.name})")
@@ -294,7 +243,9 @@ def on_run_optimizer_clicked(btn):
         print(f"  Apply alpha:           {ctx.run_type.apply_alpha}")
         print(f"  Allow ETF create/red:  {ctx.run_type.allow_etf_create_redeem}")
         print(f"  Allow EFP:             {ctx.run_type.allow_efp}")
-        print(f"  Allow new shorts:      {ctx.run_type.allow_new_shorts and ctx.portfolio.allow_new_shorts}")
+        print(
+            f"  Allow new shorts:      {ctx.run_type.allow_new_shorts and ctx.portfolio.allow_new_shorts}"
+        )
         print(f"  Leverage max:          {ctx.portfolio.leverage_max:.2f}x")
         print(f"  Gross exposure max:    {ctx.portfolio.gross_exposure_max_pct_nav:.1f}% of NAV")
         print(f"  Net exposure target:   {ctx.portfolio.net_exposure_target_pct_nav:.1f}% of NAV")
@@ -307,13 +258,19 @@ def on_run_optimizer_clicked(btn):
         print("Universe & positions summary:")
         print(f"  Instruments in universe: {df_instr.height}")
         print(f"  Positions rows:          {df_pos.height}")
-        print(f"  Cash:                    {float(df_cash.select('cash')[0, 0]):,.2f} {df_cash.select('currency')[0, 0]}")
+        print(
+            f"  Cash:                    {float(df_cash.select('cash')[0, 0]):,.2f} {df_cash.select('currency')[0, 0]}"
+        )
 
         print("")
-        print("NOTE: this is a stub. Here you would:")
-        print("  - Align instruments & positions with risk and cost data")
-        print("  - Build optimizer inputs using ctx and the snapshot")
-        print("  - Call your Mosek-based optimizer")
-        print("  - Display suggested trades in a DataGrid and export as CSV")
+        print("Suggested trades (stubbed):")
+        display(
+            DataGrid(
+                trades.to_pandas(),
+                layout={"height": "250px"},
+                base_row_size=24,
+            )
+        )
+        print("""Note: trades are rule-based placeholders. Replace with optimizer output.""")
 
   
